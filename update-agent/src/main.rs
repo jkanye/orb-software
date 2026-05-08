@@ -39,7 +39,7 @@ use orb_update_agent::{
         interfaces::{self, UpdateProgress},
         proxies,
     },
-    update, update_component_version_on_disk, Args, Settings,
+    update, update_component_version_on_disk, write_json_and_sync, Args, Settings,
 };
 use orb_update_agent_core::{
     version_map::SlotVersion, Claim, Slot, VersionMap, Versions,
@@ -330,6 +330,16 @@ fn run(args: &Args) -> eyre::Result<()> {
     } else {
         bail!("no connection to dbus supervisor, bailing");
     }
+
+    // before starting to update components, set the rootfs status for the target slot
+    slot_ctrl
+        .set_rootfs_status(
+            orb_slot_ctrl::RootFsStatus::UpdateInProcess,
+            target_slot.into(),
+        )
+        .wrap_err_with(|| {
+            format!("failed to set the rootfs status for the target slot {target_slot}")
+        })?;
 
     // Set overall status to Installing before starting component installations
     if let Some(iface) = &update_iface
@@ -779,8 +789,8 @@ fn finalize_full_update(
     info!("finalizing full system update: only updating versions but taking no extra actions");
 
     version_map.set_recovery_version(claim.version());
-    store_version_map_and_legacy(version_map, &version_map_dst, &settings.versions)
-        .wrap_err("failed storing versions")?;
+    write_json_and_sync(&version_map_dst, &version_map)?;
+    write_json_and_sync(&settings.versions, &version_map.to_legacy())?;
     Ok(())
 }
 
@@ -796,8 +806,8 @@ fn finalize_normal_update(
 ) -> eyre::Result<()> {
     let target_slot = settings.active_slot.opposite();
     version_map.set_slot_version(claim.version(), target_slot);
-    store_version_map_and_legacy(version_map, &version_map_dst, &settings.versions)
-        .wrap_err("failed storing versions")?;
+    write_json_and_sync(&version_map_dst, &version_map)?;
+    write_json_and_sync(&settings.versions, &version_map.to_legacy())?;
 
     // If a capsule update is scheduled, do not set the next active boot slot
     // The capsule update mechanism will do switch the slot and aplly the update
@@ -811,8 +821,10 @@ fn finalize_normal_update(
         if data.value() == &EFI_OS_REQUEST_CAPSULE_UPDATE[4..] {
             debug!("Capsule update detected");
             slot_ctrl
-                .mark_slot_ok(target_slot.into())
-                .unwrap_or_else(|e| warn!("{e:#}"));
+                .reset_retry_counts_to_max(target_slot.into())
+                .wrap_err_with(|| {
+                    format!("failed to reset retry counter for the target slot {target_slot}")
+                })?;
             return Ok(());
         }
     } else {
@@ -841,34 +853,6 @@ fn prepare_environment(settings: &Settings) -> eyre::Result<()> {
             settings.downloads.display(),
         )
     })
-}
-
-fn store_version_map_and_legacy(
-    map: VersionMap,
-    map_dst: &Path,
-    legacy_dst: &Path,
-) -> eyre::Result<()> {
-    serde_json::to_writer(
-        &File::options()
-            .write(true)
-            .read(true)
-            .truncate(true)
-            .open(map_dst)?,
-        &map,
-    )
-    .wrap_err("saving to version map file failed")?;
-
-    serde_json::to_writer(
-        &File::options()
-            .write(true)
-            .read(true)
-            .truncate(true)
-            .open(legacy_dst)?,
-        &map.to_legacy(),
-    )
-    .wrap_err("saving to legacy versions file failed")?;
-
-    Ok(())
 }
 
 fn shutdown_with_dbus() -> eyre::Result<()> {

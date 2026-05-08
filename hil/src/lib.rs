@@ -6,6 +6,7 @@ mod download_s3;
 mod ftdi;
 mod nfsboot;
 mod orb;
+mod relay;
 mod remote_cmd;
 mod rts;
 mod serial;
@@ -17,7 +18,8 @@ pub mod verify;
 #[path = "commands/ota/mcu_util.rs"]
 pub mod mcu_util;
 
-pub use remote_cmd::{RemoteConnectArgs, RemoteSession, RemoteTransport};
+pub use orb::{orb_manager_from_config, BootMode, OrbConfig, OrbManager, Platform};
+pub use remote_cmd::{RemoteArgs, RemoteSession, RemoteTransport};
 pub use ssh_wrapper::AuthMethod;
 
 fn current_dir() -> camino::Utf8PathBuf {

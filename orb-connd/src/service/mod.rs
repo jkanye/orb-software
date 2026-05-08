@@ -1,21 +1,25 @@
-use crate::network_manager::{NetworkManager, WifiProfile, WifiSec};
+use crate::network_manager::{
+    AccessPoint, ActiveConnState, NetworkManager, WifiProfile, WifiSec,
+};
 use crate::secure_storage::SecureStorage;
 use crate::utils::{IntoZResult, State};
 use crate::OrbCapabilities;
 use chrono::{DateTime, Utc};
+use color_eyre::eyre::ContextCompat;
 use color_eyre::{
     eyre::{bail, eyre, Context},
     Result,
 };
 use orb_connd_dbus::{Connd, OBJ_PATH, SERVICE};
 use orb_info::orb_os_release::OrbRelease;
+use serde::{Deserialize, Serialize};
 use std::cmp;
 use std::collections::HashSet;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::fs::{self, File};
 use tokio::io::{self};
-use tokio::task::{self, JoinHandle};
+use tokio::time;
 use tracing::{error, info, warn};
 use wifi::Auth;
 use wpa_conf::LegacyWpaConfig;
@@ -25,7 +29,9 @@ mod mecard;
 mod netconfig;
 mod wifi;
 mod wpa_conf;
+pub mod zoci;
 
+#[derive(Clone)]
 pub struct ConndService {
     session_dbus: zbus::Connection,
     nm: NetworkManager,
@@ -36,7 +42,7 @@ pub struct ConndService {
     profile_storage: ProfileStorage,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ProfileStorage {
     SecureStorage(SecureStorage),
     NetworkManager,
@@ -120,28 +126,31 @@ impl ConndService {
             warn!(?error, "non fatal startup failure")
         }
 
+        match connd.nm.list_wifi_profiles().await {
+            Ok(profiles) => info!("saved wifi profiles: {}", profiles.len()),
+            Err(e) => warn!("failed to read wifi profiles on startup with err {e:?}"),
+        };
+
         Ok(connd)
     }
 
-    pub fn spawn(self) -> JoinHandle<Result<()>> {
-        info!("spawning dbus service {SERVICE} at path {OBJ_PATH}!");
+    pub async fn spawn(self) -> Result<()> {
         let conn = self.session_dbus.clone();
+        info!("spawning dbus service {SERVICE} at path {OBJ_PATH}!");
 
-        task::spawn(async move {
-            conn.request_name(SERVICE)
-                .await
-                .inspect_err(|e| error!("failed to request name on dbus {e}"))?;
+        conn.request_name(SERVICE)
+            .await
+            .inspect_err(|e| error!("failed to request name on dbus {e}"))?;
 
-            conn.object_server()
-                .at(OBJ_PATH, Connd::from(self))
-                .await
-                .inspect_err(|e| error!("failed to serve obj on dbus {e}"))?;
+        conn.object_server()
+            .at(OBJ_PATH, Connd::from(self))
+            .await
+            .inspect_err(|e| error!("failed to serve obj on dbus {e}"))?;
 
-            info!("dbus service spawned successfully!");
-            futures::future::pending::<()>().await;
+        info!("dbus service spawned successfully!");
+        futures::future::pending::<()>().await;
 
-            Ok(())
-        })
+        Ok(())
     }
 
     async fn wifi_profile_add(
@@ -263,7 +272,7 @@ impl ConndService {
         };
         info!("importing {} bytes from secure storage", ss_profiles.len());
 
-        let ss_profiles: Vec<WifiProfile> = ciborium::de::from_reader(
+        let ss_profiles: Vec<StoredWifiProfile> = ciborium::de::from_reader(
             ss_profiles.as_slice(),
         )
         .wrap_err("failed to deserialize secure storage bytes into wifi profiles")?;
@@ -278,7 +287,7 @@ impl ConndService {
         for profile in to_import {
             self.wifi_profile_add(
                 &profile.ssid,
-                profile.sec,
+                profile.sec.into(),
                 &profile.psk,
                 profile.hidden,
             )
@@ -294,7 +303,13 @@ impl ConndService {
             return Ok(());
         };
 
-        let profiles = self.nm.list_wifi_profiles().await?;
+        let profiles: Vec<_> = self
+            .nm
+            .list_wifi_profiles()
+            .await?
+            .into_iter()
+            .map(StoredWifiProfile::from)
+            .collect();
 
         let mut bytes = Vec::new();
         ciborium::ser::into_writer(&profiles, &mut bytes)?;
@@ -443,6 +458,165 @@ impl ConndService {
         }
     }
 
+    async fn connect_to_wifi(&self, ssid: &str) -> Result<AccessPoint> {
+        info!("connecting to wifi with ssid {ssid}");
+        let profiles = self.nm.list_wifi_profiles().await?;
+        let max_prio = profiles
+            .iter()
+            .map(|p| p.priority)
+            .max()
+            .unwrap_or_default();
+
+        let profile = profiles
+            .into_iter()
+            .find(|p| p.ssid == ssid)
+            .wrap_err_with(|| format!("ssid {ssid} is not a saved profile"))?;
+
+        let aps = self.nm.wifi_scan().await.inspect_err(|e| {
+            error!("failed to scan for wifi networks due to err {e}")
+        })?;
+
+        let get_activated_or_activating_conn = async || {
+            self.nm
+                .active_connections()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .find(|conn| {
+                    conn.id == profile.id
+                        && (conn.state == ActiveConnState::Activated
+                            || conn.state == ActiveConnState::Activating)
+                })
+        };
+
+        let start = Instant::now();
+        let timeout = Duration::from_secs(10);
+        let backoff = Duration::from_secs(2);
+        while let Some(conn) = get_activated_or_activating_conn().await {
+            if ActiveConnState::Activated == conn.state {
+                info!("{:?}, no need to attempt connetion: {conn:?}", conn.state);
+
+                return aps.into_iter().
+                    find(|ap| ap.ssid == profile.ssid).with_context(|| format!("already connected, but could not find an ap for the connection with ssid {}. should be unreachable state.", profile.ssid));
+            }
+
+            // only possible state left is ActiveConnState::Activating
+            if start.elapsed() > timeout {
+                warn!("{:?}, connection spent too long activating, will re-add it {conn:?}", conn.state);
+                break;
+            }
+
+            info!(
+                "{:?} connection still activating, waiting {}s and trying again",
+                conn.state,
+                backoff.as_secs()
+            );
+
+            time::sleep(backoff).await;
+        }
+
+        info!(
+            "no active or activating conn, configuring new conn to profile {}",
+            profile.id
+        );
+
+        // We re-add the profile as that will overwrite the old one
+        // and is easier than re-using shitty NM d-bus api.
+        // We do this to elevate the profile's priority and make sure
+        // latest connected profile is always the highest priority one.
+        let next_priority = if profile.priority != max_prio {
+            self.get_next_priority().await.into_z()?
+        } else {
+            profile.priority
+        };
+
+        let profile = self
+            .nm
+            .wifi_profile(&profile.id)
+            .ssid(&profile.ssid)
+            .sec(profile.sec)
+            .psk(&profile.psk)
+            .priority(next_priority)
+            .hidden(profile.hidden)
+            .persist(self.profile_storage.should_persist())
+            .add()
+            .await?;
+
+        let path = profile.path.clone();
+
+        if let Err(e) = self.commit_profiles_to_storage().await {
+            error!(
+                "failed to commit profile store when removing wifi profile. err: {e}"
+            );
+        }
+
+        for ap in aps {
+            if ap.ssid == ssid {
+                info!("connecting to ap {ap:?}");
+
+                self.nm
+                    .connect_to_wifi(
+                        &path,
+                        Self::DEFAULT_WIFI_IFACE,
+                        self.connect_timeout,
+                    )
+                    .await
+                    .map_err(|e| {
+                        eyre!("failed to connect to wifi ssid {ssid} due to err {e}")
+                    })?;
+
+                info!("successfully connected to ap {ap:?}");
+
+                return Ok(ap);
+            }
+        }
+
+        Err(eyre!("could not find ssid {ssid}"))
+    }
+
+    async fn remove_wifi_profile(&self, ssid: &str) -> Result<()> {
+        info!("removing wifi profile with ssid {ssid}");
+        if ssid == Self::DEFAULT_CELLULAR_PROFILE || ssid == Self::DEFAULT_WIFI_SSID {
+            return Err(eyre!("{ssid} is not an allowed SSID name"));
+        }
+
+        self.nm.remove_profile(ssid).await?;
+
+        if let Err(e) = self.commit_profiles_to_storage().await {
+            error!(
+                "failed to commit profile store when removing wifi profile. err: {e}"
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn wifi_scan(&self) -> Result<Vec<(AccessPoint, bool, bool)>> {
+        let aps = self.nm.wifi_scan().await?;
+        let profiles = self.nm.list_wifi_profiles().await?;
+        let active_conns = self
+            .nm
+            .active_connections()
+            .await
+            .inspect_err(|e| warn!("issue retrieving active connections: {e}"))
+            .unwrap_or_default();
+
+        let aps = aps
+            .into_iter()
+            .map(|ap| {
+                let is_saved = profiles.iter().any(|profile| ap.eq_profile(profile));
+
+                let is_active = active_conns.iter().any(|conn| {
+                    conn.id == ap.ssid && conn.state == ActiveConnState::Activated
+                });
+
+                (ap, is_saved, is_active)
+            })
+            .collect();
+
+        Ok(aps)
+    }
+
     /// increments priority of newly added networks up to 999
     /// so the last added network is always higher priority than others
     async fn get_next_priority(&self) -> Result<i32> {
@@ -489,5 +663,139 @@ impl TryFrom<WifiSec> for Auth {
         };
 
         Ok(auth)
+    }
+}
+
+/// Wifiprofile type used when serializing / deserializing to store on secure storage.
+/// Do NOT change the types here unless you want wifi profiles to not be deserialized properly and
+/// all orbs to ask for Wifi QR D: -vmenge
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StoredWifiProfile {
+    pub id: String,
+    pub uuid: String,
+    pub ssid: String,
+    pub sec: StoredWifiSec,
+    pub psk: String,
+    pub autoconnect: bool,
+    pub priority: i32,
+    pub hidden: bool,
+    pub path: String,
+}
+
+/// WifiSecurity type used when serializing / deserializing to store on secure storage.
+/// Do NOT change the types here unless you want wifi profiles to not be deserialized properly and
+/// all orbs to ask for Wifi QR D: -vmenge
+#[derive(Debug, Serialize, Deserialize)]
+pub enum StoredWifiSec {
+    /// No protection (or RSN IE present but no auth/key-mgmt required).
+    Open,
+    /// Enhanced Open (OWE): opportunistic encryption without authentication.
+    Owe,
+    /// OWE transition mode: AP advertises open + OWE BSSID pair.
+    OweTransition,
+    /// Legacy WEP (avoid).
+    Wep,
+    /// WPA1 with PSK (legacy).
+    Wpa1Psk,
+    /// WPA1 with 802.1X/EAP (legacy enterprise).
+    Wpa1Eap,
+    /// WPA2-Personal (PSK).
+    Wpa2Psk,
+    /// WPA3-Personal (SAE).
+    Wpa3Sae,
+    /// WPA2/WPA3 mixed (PSK + SAE).
+    Wpa2Wpa3Transitional,
+    /// WPA2/3-Enterprise (802.1X/EAP).
+    Enterprise,
+    /// Couldn’t classify from flags.
+    Unknown,
+}
+
+impl From<WifiProfile> for StoredWifiProfile {
+    fn from(value: WifiProfile) -> Self {
+        Self {
+            id: value.id,
+            uuid: value.uuid,
+            ssid: value.ssid,
+            sec: value.sec.into(),
+            psk: value.psk,
+            autoconnect: value.autoconnect,
+            priority: value.priority,
+            hidden: value.hidden,
+            path: value.path,
+        }
+    }
+}
+
+impl From<WifiSec> for StoredWifiSec {
+    fn from(value: WifiSec) -> Self {
+        match value {
+            WifiSec::Open => Self::Open,
+            WifiSec::Owe => Self::Owe,
+            WifiSec::OweTransition => Self::OweTransition,
+            WifiSec::Wep => Self::Wep,
+            WifiSec::Wpa1Psk => Self::Wpa1Psk,
+            WifiSec::Wpa1Eap => Self::Wpa1Eap,
+            WifiSec::Wpa2Psk => Self::Wpa2Psk,
+            WifiSec::Wpa3Sae => Self::Wpa3Sae,
+            WifiSec::Wpa2Wpa3Transitional => Self::Wpa2Wpa3Transitional,
+            WifiSec::Enterprise => Self::Enterprise,
+            WifiSec::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<StoredWifiSec> for WifiSec {
+    fn from(value: StoredWifiSec) -> Self {
+        match value {
+            StoredWifiSec::Open => Self::Open,
+            StoredWifiSec::Owe => Self::Owe,
+            StoredWifiSec::OweTransition => Self::OweTransition,
+            StoredWifiSec::Wep => Self::Wep,
+            StoredWifiSec::Wpa1Psk => Self::Wpa1Psk,
+            StoredWifiSec::Wpa1Eap => Self::Wpa1Eap,
+            StoredWifiSec::Wpa2Psk => Self::Wpa2Psk,
+            StoredWifiSec::Wpa3Sae => Self::Wpa3Sae,
+            StoredWifiSec::Wpa2Wpa3Transitional => Self::Wpa2Wpa3Transitional,
+            StoredWifiSec::Enterprise => Self::Enterprise,
+            StoredWifiSec::Unknown => Self::Unknown,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// backcompat test: WifiProfile was previously serialized directly to secure
+    /// storage instead of using a separate StoredWifiProfile type.
+    #[test]
+    fn wifi_profile_deserializes_as_stored_wifi_profile() {
+        let profile = WifiProfile {
+            id: "my-network".into(),
+            uuid: "550e8400-e29b-41d4-a716-446655440000".into(),
+            ssid: "my-network".into(),
+            sec: WifiSec::Wpa2Psk,
+            psk: "hunter2".into(),
+            autoconnect: true,
+            priority: 10,
+            hidden: false,
+            path: "/org/freedesktop/NetworkManager/Settings/1".into(),
+        };
+
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&profile, &mut bytes).unwrap();
+
+        let stored: StoredWifiProfile =
+            ciborium::de::from_reader(bytes.as_slice()).unwrap();
+
+        assert_eq!(stored.id, profile.id);
+        assert_eq!(stored.uuid, profile.uuid);
+        assert_eq!(stored.ssid, profile.ssid);
+        assert_eq!(stored.psk, profile.psk);
+        assert_eq!(stored.autoconnect, profile.autoconnect);
+        assert_eq!(stored.priority, profile.priority);
+        assert_eq!(stored.hidden, profile.hidden);
+        assert_eq!(stored.path, profile.path);
     }
 }

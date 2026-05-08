@@ -1,9 +1,11 @@
 use clap::{arg, Args, ValueEnum};
-use color_eyre::{eyre::bail, Result};
+use color_eyre::Result;
 use serde::Deserialize;
 use std::fmt;
+use std::time::Duration;
 
 use crate::ftdi::FtdiGpio;
+use crate::relay::Relay;
 
 /// Orb platform type
 #[derive(Debug, Clone, Copy, ValueEnum, Deserialize)]
@@ -23,11 +25,13 @@ impl fmt::Display for Platform {
 }
 
 #[derive(Default, Debug, Clone, Copy, ValueEnum, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum PinControlType {
     #[default]
     Ftdi,
     UsbRelay,
+    NumatoRelay,
+    DsdTechRelay,
 }
 
 /// Configuration for the orb, including pin controller and serial path.
@@ -35,16 +39,13 @@ pub enum PinControlType {
 pub struct OrbConfig {
     /// Path to YAML config file for orb configuration. If provided, other
     /// arguments are ignored.
-    #[arg(long)]
+    #[arg(long, default_value = "/etc/worldcoin/orb.yaml")]
     #[serde(skip)]
-    pub orb_config_path: Option<std::path::PathBuf>,
+    pub orb_config_path: std::path::PathBuf,
 
     /// Orb identifier (e.g., serial number or name)
     #[arg(long)]
     pub orb_id: Option<String>,
-
-    #[arg(long)]
-    pub hostname: Option<String>,
 
     /// Platform type (diamond or pearl)
     #[arg(long, value_enum)]
@@ -66,12 +67,24 @@ pub struct OrbConfig {
     /// FTDI device description
     #[arg(long)]
     pub desc: Option<String>,
+
+    /// Relay board device path. For UsbRelay: /dev/hidrawN. For NumatoRelay: /dev/ttyACMN.
+    #[arg(long)]
+    pub relay_bank: Option<String>,
+
+    /// Relay channel for the power button. UsbRelay: 1-indexed (1..=8). NumatoRelay: 0-indexed (0..=7).
+    #[arg(long)]
+    pub relay_power_channel: Option<u32>,
+
+    /// Relay channel for recovery mode. UsbRelay: 1-indexed (1..=8). NumatoRelay: 0-indexed (0..=7).
+    #[arg(long)]
+    pub relay_recovery_channel: Option<u32>,
 }
 
 impl OrbConfig {
     pub fn use_file_if_exists(&self) -> Result<OrbConfig> {
-        if let Some(config_path) = &self.orb_config_path {
-            let file = std::fs::File::open(config_path)?;
+        if self.orb_config_path.exists() {
+            let file = std::fs::File::open(&self.orb_config_path)?;
             let config: OrbConfig = serde_yaml::from_reader(file)?;
             Ok(config)
         } else {
@@ -79,12 +92,8 @@ impl OrbConfig {
         }
     }
 
-    /// Creates a hostname from the orb_id by prepending "orb-".
     /// Returns None if orb_id is not set.
     pub fn get_hostname(&self) -> Option<String> {
-        if self.hostname.is_some() {
-            return self.hostname.clone();
-        }
         self.orb_id.as_ref().map(|id| format!("orb-{}.local", id))
     }
 }
@@ -142,7 +151,58 @@ pub fn orb_manager_from_config(
             Ok(Box::new(configured.configure()?))
         }
         PinControlType::UsbRelay => {
-            bail!("Relay pin controller not yet implemented")
+            let bank = config.relay_bank.as_deref().unwrap_or("/dev/hidraw0");
+            let power_channel = config.relay_power_channel.unwrap_or(2);
+            let recovery_channel = config.relay_recovery_channel.unwrap_or(1);
+            let (off_duration, on_duration) = match &config.platform {
+                Some(Platform::Diamond) => {
+                    (Duration::from_secs(6), Duration::from_secs(3))
+                }
+                _ => (Duration::from_secs(10), Duration::from_secs(4)),
+            };
+            Ok(Box::new(Relay::new_usb_hid(
+                bank,
+                power_channel,
+                recovery_channel,
+                off_duration,
+                on_duration,
+            )?))
+        }
+        PinControlType::NumatoRelay => {
+            let device_path = config.relay_bank.as_deref().unwrap_or("/dev/ttyACM0");
+            let power_channel = config.relay_power_channel.unwrap_or(1);
+            let recovery_channel = config.relay_recovery_channel.unwrap_or(0);
+            let (off_duration, on_duration) = match &config.platform {
+                Some(Platform::Diamond) => {
+                    (Duration::from_secs(6), Duration::from_secs(3))
+                }
+                _ => (Duration::from_secs(10), Duration::from_secs(4)),
+            };
+            Ok(Box::new(Relay::new_numato(
+                device_path,
+                power_channel,
+                recovery_channel,
+                off_duration,
+                on_duration,
+            )?))
+        }
+        PinControlType::DsdTechRelay => {
+            let device_path = config.relay_bank.as_deref().unwrap_or("/dev/ttyUSB1");
+            let power_channel = config.relay_power_channel.unwrap_or(1);
+            let recovery_channel = config.relay_recovery_channel.unwrap_or(2);
+            let (off_duration, on_duration) = match &config.platform {
+                Some(Platform::Diamond) => {
+                    (Duration::from_secs(6), Duration::from_secs(3))
+                }
+                _ => (Duration::from_secs(10), Duration::from_secs(4)),
+            };
+            Ok(Box::new(Relay::new_dsd_tech(
+                device_path,
+                power_channel,
+                recovery_channel,
+                off_duration,
+                on_duration,
+            )?))
         }
     }
 }
